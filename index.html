@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>弾幕シューティングゲーム</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #222;
+            font-family: 'Arial', sans-serif;
+            color: #fff;
+            overflow: hidden; /* スクロールバーを隠す */
+        }
+        #gameContainer {
+            position: relative; /* 子要素の絶対配置の基準とする */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        canvas {
+            border: 2px solid #fff;
+            background-color: #000;
+            border-radius: 8px;
+            box-shadow: 0 0 15px rgba(255, 255, 255, 0.5);
+        }
+        .screen { /* スタート画面とゲームオーバー画面共通のスタイル */
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(0, 0, 0, 0.85);
+            padding: 30px;
+            border-radius: 10px;
+            text-align: center;
+            border: 2px solid #fff;
+            z-index: 10; /* キャンバスより手前に表示 */
+        }
+        .screen h2 {
+            margin-top: 0;
+            font-size: 32px;
+        }
+        .screen p {
+            font-size: 20px;
+        }
+        .screen button {
+            padding: 12px 25px;
+            font-size: 18px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            margin-top: 15px;
+        }
+        .screen button:hover {
+            background-color: #45a049;
+        }
+        #gameOverScreen h2 { color: #ff4444; }
+
+        #controlsInfo {
+            display: none; /* 初期非表示 */
+            margin-top: 15px;
+            font-size: 16px;
+            text-align: center;
+            background-color: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+        #scoreBoard {
+            display: none; /* 初期非表示 */
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 24px;
+            color: #fff;
+            background-color: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 5;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="gameCanvas"></canvas>
+        <div id="startScreen" class="screen">
+            <h2>弾幕シューティング</h2>
+            <p>スペースキー / Aボタン でスタート</p>
+            <button id="startButtonElem">ゲーム開始</button>
+        </div>
+        <div id="gameOverScreen" class="screen">
+            <h2>ゲームオーバー</h2>
+            <p id="finalScore"></p>
+            <p style="font-size: 16px; margin-top: 10px;">スペースキー/Aボタンでもう一度プレイ</p>
+            <button id="restartButton">もう一度プレイ</button>
+        </div>
+        <div id="controlsInfo">
+            操作: 方向キー/Dパッドで移動 (ショットは自動), スペースキー/Aボタン長押しで高速移動
+        </div>
+         <div id="scoreBoard">スコア: 0</div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const scoreBoard = document.getElementById('scoreBoard');
+        const startScreen = document.getElementById('startScreen');
+        const gameOverScreen = document.getElementById('gameOverScreen');
+        const finalScoreDisplay = document.getElementById('finalScore');
+        const restartButton = document.getElementById('restartButton');
+        const startButtonElem = document.getElementById('startButtonElem');
+        const controlsInfo = document.getElementById('controlsInfo');
+
+
+        let canvasWidth = 400;
+        let canvasHeight = 600;
+        let audioInitialized = false;
+        let gameState = 'title'; // 'title', 'playing', 'gameOver'
+        let actionButtonPressedLastFrame = false; // ゲームパッドのボタン連続押下防止
+
+        // --- Sound Effects Setup ---
+        const shootSound = new Tone.Synth({
+            oscillator: { type: 'triangle' },
+            envelope: { attack: 0.005, decay: 0.05, sustain: 0, release: 0.1 },
+            volume: -15
+        }).toDestination();
+
+        const enemyExplosionSound = new Tone.NoiseSynth({
+            noise: { type: 'white' },
+            envelope: { attack: 0.005, decay: 0.1, sustain: 0, release: 0.1 },
+            volume: -10
+        }).toDestination();
+        const enemyExplosionPitch = new Tone.Synth({
+            oscillator: { type: 'sawtooth' },
+            envelope: { attack: 0.005, decay: 0.08, sustain: 0, release: 0.1 },
+            volume: -18
+        }).toDestination();
+        let enemyExplosionSoundRecentlyPlayed = false;
+        const ENEMY_EXPLOSION_SOUND_COOLDOWN_MS = 50;
+
+        const playerHitSound = new Tone.Synth({
+            oscillator: { type: 'square' },
+            envelope: { attack: 0.01, decay: 0.2, sustain: 0, release: 0.2 },
+            volume: -8
+        }).toDestination();
+        
+        let playerHitSoundRecentlyPlayed = false; 
+        const PLAYER_HIT_SOUND_COOLDOWN_MS = 100; 
+        // --- End Sound Effects Setup ---
+
+        function resizeCanvas() {
+            const aspectRatio = 2 / 3;
+            const padding = 20;
+            const controlsUiHeight = controlsInfo.offsetHeight > 0 ? controlsInfo.offsetHeight + 15 : 50; 
+            const availableHeight = window.innerHeight - padding * 2 - controlsUiHeight;
+            const availableWidth = window.innerWidth - padding * 2;
+
+            if (availableWidth / availableHeight > aspectRatio) {
+                canvasHeight = availableHeight;
+                canvasWidth = canvasHeight * aspectRatio;
+            } else {
+                canvasWidth = availableWidth;
+                canvasHeight = canvasWidth / aspectRatio;
+            }
+
+            canvas.width = canvasWidth;
+            canvas.height = canvasHeight;
+            
+            player.width = canvasWidth * 0.08;
+            player.height = canvasWidth * 0.08;
+            player.x = canvas.width / 2 - player.width / 2;
+            player.y = canvas.height - player.height - 20;
+            // 自機の基本速度を計算 (canvasWidth に依存) - さらに遅く
+            player.baseSpeed = (canvasWidth * 0.002); // 以前は 0.004
+            
+            // 他の速度も全体的に遅くする
+            bulletSpeed = canvasHeight * 0.0065; // 以前は 0.013
+            enemyBulletSpeed = canvasHeight * 0.002; // 以前は 0.004
+            homingMissileSpeed = canvasHeight * 0.00175; // 以前は 0.0035
+        }
+
+        const player = {
+            x: canvas.width / 2 - 20, 
+            y: canvas.height - 60,  
+            width: 32,              
+            height: 32,             
+            color: '#00ffcc',
+            baseSpeed: 0.8, // 初期値、resizeCanvasで上書き (例: 400 * 0.002 = 0.8)
+            currentSpeedFactor: 1, 
+            dx_input: 0, 
+            dy_input: 0, 
+            lives: 3,
+            invincible: false,
+            invincibleTimer: 0,
+            invincibleDuration: 120 
+        };
+
+        const bullets = [];
+        const bulletRadius = 3.5; 
+        const bulletColor = '#99ffff'; 
+        let bulletSpeed = 4.5; // 初期値、resizeCanvasで上書き
+        let canShoot = true;
+        const shootCooldown = 18; 
+        let shootTimer = 0;
+
+        const enemies = [];
+        const enemyWidth = 30;
+        const enemyHeight = 30;
+        const enemyColor = '#ff6666'; 
+        const spinnerColor = '#cc33ff'; 
+        const homingEnemyColor = '#66ff66'; 
+        let enemySpeed = 0.75; // 以前は 1.5
+        let enemySpawnInterval = 45; 
+        let enemySpawnTimer = 0;
+
+        const enemyBullets = [];
+        const enemyBulletRadius = 5;
+        const enemyBulletColor = '#ff9933';
+        let enemyBulletSpeed = 1.25; // 初期値、resizeCanvasで上書き
+
+        const homingMissiles = [];
+        const homingMissileRadius = 4;
+        const homingMissileColor = '#ffff66'; 
+        let homingMissileSpeed = 1.1; // 初期値、resizeCanvasで上書き
+
+        let score = 0;
+        let animationFrameId;
+
+        const stars = [];
+        const numStars = 120;
+        const starSpeed = 0.4; // 以前は 0.8
+
+        const keys = {}; 
+        let gamepad = null; 
+
+        function initStars() {
+            stars.length = 0;
+            for (let i = 0; i < numStars; i++) {
+                stars.push({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    radius: Math.random() * 1.2,
+                    alpha: Math.random() * 0.4 + 0.3
+                });
+            }
+        }
+
+        function drawStars() {
+            stars.forEach(star => {
+                ctx.beginPath();
+                ctx.arc(star.x, star.y, star.radius, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255, 255, 255, ${star.alpha})`;
+                ctx.fill();
+                star.y += starSpeed;
+                if (star.y > canvas.height) {
+                    star.y = 0;
+                    star.x = Math.random() * canvas.width;
+                }
+            });
+        }
+
+        function drawPlayer() {
+            if (player.invincible && Math.floor(player.invincibleTimer / 8) % 2 === 0) {
+                return;
+            }
+            ctx.fillStyle = (keys[' '] || (gamepad && gamepad.buttons[0] && gamepad.buttons[0].pressed)) ? '#00aaaa' : player.color; 
+            ctx.beginPath();
+            ctx.moveTo(player.x + player.width / 2, player.y);
+            ctx.lineTo(player.x, player.y + player.height);
+            ctx.lineTo(player.x + player.width, player.y + player.height);
+            ctx.closePath();
+            ctx.fill();
+        }
+
+        function drawBullets() {
+            bullets.forEach(bullet => {
+                ctx.beginPath();
+                ctx.arc(bullet.x, bullet.y, bulletRadius, 0, Math.PI * 2);
+                ctx.fillStyle = bulletColor;
+                ctx.fill();
+            });
+        }
+
+        function drawEnemies() {
+            enemies.forEach(enemy => {
+                ctx.fillStyle = enemy.color;
+                if (enemy.type === 'homing') {
+                    ctx.fillRect(enemy.x, enemy.y, enemy.width, enemy.height);
+                } else { 
+                    ctx.beginPath();
+                    ctx.moveTo(enemy.x, enemy.y);
+                    ctx.lineTo(enemy.x + enemy.width, enemy.y);
+                    ctx.lineTo(enemy.x + enemy.width * 0.8, enemy.y + enemy.height);
+                    ctx.lineTo(enemy.x + enemy.width * 0.2, enemy.y + enemy.height);
+                    ctx.closePath();
+                    ctx.fill();
+                }
+            });
+        }
+
+        function drawEnemyBullets() {
+            enemyBullets.forEach(bullet => {
+                ctx.beginPath();
+                ctx.arc(bullet.x, bullet.y, bullet.radius, 0, Math.PI * 2);
+                ctx.fillStyle = bullet.color;
+                ctx.fill();
+            });
+        }
+        
+        function drawHomingMissiles() {
+            homingMissiles.forEach(missile => {
+                ctx.beginPath();
+                ctx.moveTo(missile.x, missile.y - missile.radius); 
+                ctx.lineTo(missile.x - missile.radius / 2, missile.y + missile.radius / 2);
+                ctx.lineTo(missile.x + missile.radius / 2, missile.y + missile.radius / 2);
+                ctx.closePath();
+                ctx.fillStyle = homingMissileColor;
+                ctx.fill();
+            });
+        }
+        
+        function handleInput() {
+            player.dx_input = 0;
+            player.dy_input = 0;
+            player.currentSpeedFactor = 1; 
+
+            if (gamepad) {
+                if (gamepad.buttons[14] && gamepad.buttons[14].pressed) player.dx_input = -1;
+                if (gamepad.buttons[15] && gamepad.buttons[15].pressed) player.dx_input = 1;
+                if (gamepad.buttons[12] && gamepad.buttons[12].pressed) player.dy_input = -1;
+                if (gamepad.buttons[13] && gamepad.buttons[13].pressed) player.dy_input = 1;
+
+                if (gamepad.buttons[0] && gamepad.buttons[0].pressed) {
+                    player.currentSpeedFactor = 2;
+                }
+            }
+
+            if (keys['ArrowLeft']) player.dx_input = -1;
+            if (keys['ArrowRight']) player.dx_input = 1;
+            if (keys['ArrowUp']) player.dy_input = -1;
+            if (keys['ArrowDown']) player.dy_input = 1;
+            
+            if (keys[' ']) { 
+                player.currentSpeedFactor = 2;
+            }
+        }
+
+
+        function movePlayer() {
+            const actualSpeed = player.baseSpeed * player.currentSpeedFactor;
+            
+            player.x += player.dx_input * actualSpeed;
+            player.y += player.dy_input * actualSpeed;
+
+            if (player.x < 0) player.x = 0;
+            if (player.x + player.width > canvas.width) player.x = canvas.width - player.width;
+            if (player.y < 0) player.y = 0;
+            if (player.y + player.height > canvas.height) player.y = canvas.height - player.height;
+
+            if (player.invincible) {
+                player.invincibleTimer--;
+                if (player.invincibleTimer <= 0) {
+                    player.invincible = false;
+                }
+            }
+        }
+
+        function moveBullets() {
+            bullets.forEach((bullet, index) => {
+                bullet.x += bullet.speedX;
+                bullet.y += bullet.speedY;
+                if (bullet.y + bulletRadius < 0 || bullet.y - bulletRadius > canvas.height ||
+                    bullet.x + bulletRadius < 0 || bullet.x - bulletRadius > canvas.width) {
+                    bullets.splice(index, 1);
+                }
+            });
+        }
+
+        function moveEnemies() {
+            enemies.forEach((enemy, index) => {
+                enemy.y += enemy.speed; // enemy.speed は直接半分に
+
+                if (enemy.y > canvas.height) {
+                    enemies.splice(index, 1);
+                }
+
+                enemy.shootTimer = (enemy.shootTimer || 0) + 1;
+                if (enemy.shootTimer >= enemy.shootInterval) {
+                    enemy.shootTimer = 0;
+                    if (enemy.y < canvas.height * 0.8 && enemy.y > 0) { 
+                        if (enemy.type === 'shooter') {
+                            const angleOffset = Math.PI / 12; 
+                            for (let i = -1; i <= 1; i++) {
+                                enemyBullets.push({
+                                    x: enemy.x + enemy.width / 2,
+                                    y: enemy.y + enemy.height,
+                                    radius: enemyBulletRadius,
+                                    color: enemyBulletColor,
+                                    speedX: Math.sin(i * angleOffset) * (enemyBulletSpeed * 0.85),
+                                    speedY: Math.cos(i * angleOffset) * (enemyBulletSpeed * 0.85),
+                                });
+                            }
+                        } else if (enemy.type === 'spinner') {
+                            const bulletsToShoot = 10; 
+                            for (let i = 0; i < bulletsToShoot; i++) {
+                                const angle = (Math.PI * 2 / bulletsToShoot) * i + (enemy.spinAngle || 0);
+                                enemyBullets.push({
+                                    x: enemy.x + enemy.width / 2,
+                                    y: enemy.y + enemy.height / 2,
+                                    radius: enemyBulletRadius * 0.75,
+                                    color: '#ff66ff', 
+                                    speedX: Math.cos(angle) * enemyBulletSpeed * 0.7,
+                                    speedY: Math.sin(angle) * enemyBulletSpeed * 0.7,
+                                });
+                            }
+                            enemy.spinAngle = (enemy.spinAngle || 0) + Math.PI / 24; 
+                        } else if (enemy.type === 'homing') {
+                            const dxPlayer = player.x + player.width / 2 - (enemy.x + enemy.width / 2);
+                            const dyPlayer = player.y + player.height / 2 - (enemy.y + enemy.height / 2);
+                            const angle = Math.atan2(dyPlayer, dxPlayer);
+                            homingMissiles.push({
+                                x: enemy.x + enemy.width / 2,
+                                y: enemy.y + enemy.height,
+                                radius: homingMissileRadius,
+                                color: homingMissileColor,
+                                speedX: Math.cos(angle) * homingMissileSpeed,
+                                speedY: Math.sin(angle) * homingMissileSpeed,
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
+        function moveEnemyBullets() {
+            enemyBullets.forEach((bullet, index) => {
+                bullet.x += bullet.speedX; // speedX, speedY は enemyBulletSpeed を基に計算されるので間接的に影響
+                bullet.y += bullet.speedY;
+                if (bullet.y - bullet.radius > canvas.height || bullet.y + bullet.radius < 0 ||
+                    bullet.x - bullet.radius > canvas.width || bullet.x + bullet.radius < 0) {
+                    enemyBullets.splice(index, 1);
+                }
+            });
+        }
+        
+        function moveHomingMissiles() {
+            homingMissiles.forEach((missile, index) => {
+                missile.x += missile.speedX; // speedX, speedY は homingMissileSpeed を基に計算
+                missile.y += missile.speedY;
+
+                if (missile.y + missile.radius < 0 || missile.y - missile.radius > canvas.height ||
+                    missile.x + missile.radius < 0 || missile.x - missile.radius > canvas.width) {
+                    homingMissiles.splice(index, 1);
+                }
+            });
+        }
+
+        function spawnEnemy() {
+            enemySpawnTimer++;
+            if (enemySpawnTimer >= enemySpawnInterval) {
+                enemySpawnTimer = 0;
+                const enemiesToSpawn = 1 + (score > 3000 ? Math.floor(Math.random() * 2) : 0); 
+
+                for (let i = 0; i < enemiesToSpawn; i++) {
+                    const x = Math.random() * (canvas.width - enemyWidth);
+                    const y = -enemyHeight - (i * (enemyHeight + 10)); 
+                    let currentEnemySpeed = enemySpeed + Math.random() * (score / 5000); // スコアによる速度上昇も緩やかに (分母を大きく)
+
+                    let type = 'shooter';
+                    let color = enemyColor;
+                    let shootInterval = 80 + Math.random() * 40; 
+                    const randomType = Math.random();
+
+                    if (score > 1500 && randomType < 0.20) { 
+                        type = 'homing';
+                        color = homingEnemyColor;
+                        shootInterval = 140 + Math.random() * 50; 
+                        currentEnemySpeed = enemySpeed * 0.75; // Homingはさらに遅く
+                    } else if (score > 800 && randomType < 0.45) { 
+                        type = 'spinner';
+                        color = spinnerColor;
+                        shootInterval = 110 + Math.random() * 40; 
+                    }
+
+                    enemies.push({
+                        x, y,
+                        width: enemyWidth, height: enemyHeight,
+                        color: color,
+                        speed: currentEnemySpeed, // 調整された速度を使用
+                        type: type,
+                        shootInterval: shootInterval,
+                        shootTimer: Math.random() * shootInterval 
+                    });
+                }
+
+                if (enemySpawnInterval > 15) { 
+                    enemySpawnInterval -= 0.15; 
+                }
+            }
+        }
+
+        function checkCollisions() {
+            bullets.forEach((bullet, bulletIndex) => {
+                enemies.forEach((enemy, enemyIndex) => {
+                    if (bullet.x - bulletRadius < enemy.x + enemy.width &&
+                        bullet.x + bulletRadius > enemy.x &&
+                        bullet.y - bulletRadius < enemy.y + enemy.height &&
+                        bullet.y + bulletRadius > enemy.y) {
+                        
+                        if (bullets[bulletIndex]) bullets.splice(bulletIndex, 1);
+                        if (enemies[enemyIndex]) {
+                            if (audioInitialized && !enemyExplosionSoundRecentlyPlayed) { 
+                                const explosionTimeOffset1 = 0.005 + Math.random() * 0.02; 
+                                const explosionTimeOffset2 = 0.010 + Math.random() * 0.02; 
+                                enemyExplosionSound.triggerAttackRelease('8n', Tone.now() + explosionTimeOffset1); 
+                                enemyExplosionPitch.triggerAttackRelease('C2', '8n', Tone.now() + explosionTimeOffset2);
+                                
+                                enemyExplosionSoundRecentlyPlayed = true; 
+                                setTimeout(() => {
+                                    enemyExplosionSoundRecentlyPlayed = false; 
+                                }, ENEMY_EXPLOSION_SOUND_COOLDOWN_MS);
+                            }
+                            enemies.splice(enemyIndex, 1);
+                            let points = 0;
+                            if (enemy.type === 'shooter') points = 90;
+                            else if (enemy.type === 'spinner') points = 220;
+                            else if (enemy.type === 'homing') points = 180; 
+                            score += points;
+                            updateScore();
+                        }
+                    }
+                });
+            });
+
+            const playerHitbox = {
+                x: player.x + player.width / 2,
+                y: player.y + player.height / 2,
+                radius: player.width / 4 
+            };
+
+            if (!player.invincible) { 
+                let hitOccurredThisFrame = false; 
+
+                enemyBullets.forEach((bullet, bulletIndex) => {
+                    if (hitOccurredThisFrame) return; 
+                    const dx = bullet.x - playerHitbox.x;
+                    const dy = bullet.y - playerHitbox.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    if (distance < bullet.radius + playerHitbox.radius) {
+                        if (enemyBullets[bulletIndex]) enemyBullets.splice(bulletIndex, 1);
+                        handlePlayerHit();
+                        hitOccurredThisFrame = true;
+                    }
+                });
+
+                homingMissiles.forEach((missile, missileIndex) => {
+                    if (hitOccurredThisFrame) return;
+                    const dx = missile.x - playerHitbox.x;
+                    const dy = missile.y - playerHitbox.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    if (distance < missile.radius + playerHitbox.radius) {
+                        if (homingMissiles[missileIndex]) homingMissiles.splice(missileIndex, 1);
+                        handlePlayerHit();
+                        hitOccurredThisFrame = true;
+                    }
+                });
+
+                enemies.forEach((enemy, enemyIndex) => {
+                    if (hitOccurredThisFrame) return;
+                    const enemyCenterX = enemy.x + enemy.width / 2;
+                    const enemyCenterY = enemy.y + enemy.height / 2;
+                    const enemyHitboxRadius = Math.min(enemy.width, enemy.height) / 2.5; 
+
+                    const dxEnemy = enemyCenterX - playerHitbox.x;
+                    const dyEnemy = enemyCenterY - playerHitbox.y;
+                    const distanceEnemy = Math.sqrt(dxEnemy * dxEnemy + dyEnemy * dyEnemy);
+
+                    if (distanceEnemy < playerHitbox.radius + enemyHitboxRadius) {
+                        if (enemies[enemyIndex]) enemies.splice(enemyIndex, 1);
+                        handlePlayerHit(); 
+                        hitOccurredThisFrame = true;
+                    }
+                });
+            }
+        }
+
+        function handlePlayerHit() {
+            if (player.invincible) return; 
+
+            enemyBullets.length = 0;
+            homingMissiles.length = 0;
+
+            if (audioInitialized && !playerHitSoundRecentlyPlayed) {
+                const playTime = Tone.now() + 0.01; 
+                playerHitSound.triggerAttackRelease('F#3', '4n', playTime); 
+                playerHitSoundRecentlyPlayed = true;
+                setTimeout(() => {
+                    playerHitSoundRecentlyPlayed = false;
+                }, PLAYER_HIT_SOUND_COOLDOWN_MS);
+            }
+
+            player.lives--;
+            player.invincible = true; 
+            player.invincibleTimer = player.invincibleDuration;
+
+            if (player.lives <= 0) {
+                endGame();
+            }
+        }
+
+        function updateScore() {
+            scoreBoard.textContent = `スコア: ${score}  ライフ: ${player.lives}`;
+        }
+        
+        function resetGameCore() { 
+            player.x = canvas.width / 2 - player.width / 2;
+            player.y = canvas.height - player.height - 20;
+            player.dx_input = 0; 
+            player.dy_input = 0;
+            player.currentSpeedFactor = 1;
+            player.lives = 3;
+            player.invincible = false;
+            player.invincibleTimer = 0;
+            playerHitSoundRecentlyPlayed = false; 
+            enemyExplosionSoundRecentlyPlayed = false; 
+
+            bullets.length = 0;
+            enemies.length = 0;
+            enemyBullets.length = 0;
+            homingMissiles.length = 0; 
+
+            score = 0;
+            enemySpawnInterval = 45; 
+            enemySpawnTimer = 0;
+            shootTimer = 0;
+            canShoot = true;
+            updateScore(); 
+        }
+
+
+        function startGame() {
+            if (gameState !== 'title') return;
+            resizeCanvas(); 
+            gameState = 'playing';
+            startScreen.style.display = 'none';
+            scoreBoard.style.display = 'block';
+            controlsInfo.style.display = 'block';
+            
+            if (!audioInitialized) {
+                 initializeAudio().catch(err => console.error("Audio init failed on start:", err));
+            }
+            resetGameCore();
+            
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            gameLoop(); 
+        }
+        
+        function resetGame() { 
+            if (gameState !== 'gameOver') return;
+            resizeCanvas(); 
+            gameState = 'playing';
+            gameOverScreen.style.display = 'none';
+            scoreBoard.style.display = 'block';
+            controlsInfo.style.display = 'block';
+
+            resetGameCore();
+
+            if (Tone.context.state !== 'running') {
+                Tone.context.resume().catch(err => console.error("Tone context resume failed:", err));
+            }
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            gameLoop();
+        }
+
+        function endGame() {
+            gameState = 'gameOver';
+            gameOverScreen.style.display = 'block';
+            finalScoreDisplay.textContent = `最終スコア: ${score}`;
+            scoreBoard.style.display = 'none'; 
+            controlsInfo.style.display = 'none'; 
+        }
+
+
+        function pollGamepads() {
+            const gamepads = navigator.getGamepads ? navigator.getGamepads() : (navigator.webkitGetGamepads ? navigator.webkitGetGamepads() : []);
+            if (gamepads && gamepads[0]) {
+                gamepad = gamepads[0]; 
+            } else {
+                gamepad = null;
+            }
+        }
+
+        function gameLoop() {
+            pollGamepads(); 
+
+            if (gameState === 'title') {
+                if (gamepad && gamepad.buttons[0] && gamepad.buttons[0].pressed) {
+                    if (!actionButtonPressedLastFrame) {
+                        startGame();
+                        actionButtonPressedLastFrame = true; 
+                    }
+                } else if (gamepad && gamepad.buttons[0] && !gamepad.buttons[0].pressed) {
+                    actionButtonPressedLastFrame = false; 
+                }
+            } else if (gameState === 'playing') {
+                handleInput();  
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                drawStars();
+                drawPlayer();
+                drawBullets();
+                drawEnemies();
+                drawEnemyBullets();
+                drawHomingMissiles(); 
+                movePlayer();
+                moveBullets(); 
+                moveEnemies();
+                moveEnemyBullets();
+                moveHomingMissiles(); 
+                spawnEnemy();
+                checkCollisions();
+
+                if (canShoot) {
+                    if (audioInitialized) {
+                         shootSound.triggerAttackRelease('C5', '16n', Tone.now() + 0.001 + Math.random()*0.005); 
+                    }
+                    const spreadAngle1 = Math.PI / 20; 
+                    const spreadAngle2 = Math.PI / 10; 
+
+                    bullets.push({ x: player.x + player.width / 2, y: player.y, speedX: 0, speedY: -bulletSpeed });
+                    bullets.push({ x: player.x + player.width / 2, y: player.y, speedX: Math.sin(spreadAngle1) * bulletSpeed, speedY: -Math.cos(spreadAngle1) * bulletSpeed });
+                    bullets.push({ x: player.x + player.width / 2, y: player.y, speedX: -Math.sin(spreadAngle1) * bulletSpeed, speedY: -Math.cos(spreadAngle1) * bulletSpeed });
+                    bullets.push({ x: player.x + player.width / 2, y: player.y, speedX: Math.sin(spreadAngle2) * bulletSpeed, speedY: -Math.cos(spreadAngle2) * bulletSpeed });
+                    bullets.push({ x: player.x + player.width / 2, y: player.y, speedX: -Math.sin(spreadAngle2) * bulletSpeed, speedY: -Math.cos(spreadAngle2) * bulletSpeed });
+                    canShoot = false;
+                }
+
+                if (!canShoot) {
+                    shootTimer++;
+                    if (shootTimer >= shootCooldown) {
+                        canShoot = true;
+                        shootTimer = 0;
+                    }
+                }
+                updateScore();
+            } else if (gameState === 'gameOver') {
+                 if (gamepad && gamepad.buttons[0] && gamepad.buttons[0].pressed) {
+                    if (!actionButtonPressedLastFrame) {
+                        resetGame();
+                        actionButtonPressedLastFrame = true;
+                    }
+                } else if (gamepad && gamepad.buttons[0] && !gamepad.buttons[0].pressed) {
+                     actionButtonPressedLastFrame = false;
+                }
+            }
+            
+            animationFrameId = requestAnimationFrame(gameLoop);
+        }
+
+        async function initializeAudio() {
+            if (!audioInitialized && Tone.context.state !== 'running') { 
+                try {
+                    await Tone.start();
+                    audioInitialized = true;
+                    console.log("Audio context started by user interaction.");
+                } catch (err) {
+                    console.error("Failed to start audio context:", err);
+                }
+            } else if (Tone.context.state === 'running') {
+                 audioInitialized = true; 
+            }
+        }
+        
+        document.addEventListener('keydown', async (e) => {
+            if (!audioInitialized) {
+                await initializeAudio();
+            }
+            keys[e.key] = true; 
+
+            if (gameState === 'title' && e.key === ' ') { 
+                if (!actionButtonPressedLastFrame) { 
+                    startGame();
+                    actionButtonPressedLastFrame = true; 
+                }
+            } else if (gameState === 'gameOver' && e.key === ' ') { 
+                 if (!actionButtonPressedLastFrame) {
+                    resetGame();
+                    actionButtonPressedLastFrame = true;
+                }
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            keys[e.key] = false; 
+            if (e.key === ' ') { 
+                actionButtonPressedLastFrame = false;
+            }
+        });
+        
+        window.addEventListener("gamepadconnected", (e) => {
+            console.log("Gamepad connected at index %d: %s. %d buttons, %d axes.",
+              e.gamepad.index, e.gamepad.id,
+              e.gamepad.buttons.length, e.gamepad.axes.length);
+            pollGamepads(); 
+        });
+
+        window.addEventListener("gamepaddisconnected", (e) => {
+            console.log("Gamepad disconnected from index %d: %s",
+              e.gamepad.index, e.gamepad.id);
+            gamepad = null; 
+        });
+
+
+        startButtonElem.addEventListener('click', async () => {
+             if (!audioInitialized) {
+                await initializeAudio();
+            }
+            startGame();
+        });
+        restartButton.addEventListener('click', async () => {
+             if (!audioInitialized) { 
+                await initializeAudio();
+            }
+            resetGame();
+        });
+
+        window.addEventListener('resize', () => {
+            const currentGameState = gameState;
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            resizeCanvas(); 
+            if (currentGameState === 'playing'){
+                // playing中のリサイズはあまり考慮しない（必要なら位置再調整）
+            } else if (currentGameState === 'title'){
+                startScreen.style.display = 'block';
+            } else if (currentGameState === 'gameOver'){
+                gameOverScreen.style.display = 'block';
+                finalScoreDisplay.textContent = `最終スコア: ${score}`; 
+            }
+            initStars(); 
+            gameLoop(); 
+        });
+
+        // 初期化処理
+        resizeCanvas(); 
+        initStars();
+        startScreen.style.display = 'block'; 
+        scoreBoard.style.display = 'none';
+        controlsInfo.style.display = 'none';
+        gameLoop(); 
+    </script>
+</body>
+</html>
